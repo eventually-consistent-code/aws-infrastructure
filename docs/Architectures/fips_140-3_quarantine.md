@@ -18,7 +18,7 @@ Adopt pre-existing Dev / Collab / Prod accounts into an AWS Control Tower (CT) l
 | Orchestration | Terragrunt | DRY across accounts/environments; generates backend + provider wiring AFT's module deliberately doesn't manage |
 | Account vending | AFT module `aws-ia/control_tower_account_factory` `1.20.1` | Only AWS-supported Terraform-native vending path; account requests + customizations as code |
 | VCS | GitLab (`vcs_provider = "gitlab"`, or `"gitlabselfmanaged"` if self-hosted) | Team standard; AFT supports it natively via AWS CodeConnections |
-| State | S3 + DynamoDB, management account, us-east-1 | No external state services; management account owns all state |
+| State | GitLab-managed OpenTofu state (HTTP backend) | State lives with the code and the MR workflow; native locking via the HTTP backend's lock/unlock methods — no DynamoDB table to babysit. See the FIPS-boundary note in Phase 2A |
 
 Why this shape: enrollment (not rebuild) preserves the existing workloads, Account Factory makes the baseline reproducible, and evidence-copy-to-Forensics beats analyze-in-place because the compromised account's blast radius never touches your analysis environment…
 
@@ -67,7 +67,10 @@ Two repo-specific corrections up front:
 New phase — the original plan assumed Account Factory was already running. Building it:
 
 - **Vend the AFT management account first** via CT's built-in Account Factory (Service Catalog, console — one of the few unavoidable ClickOps moments). AFT requires its own dedicated account; it is not optional and it is not the CT management account.
-- **Deploy the AFT module** (`aws-ia/control_tower_account_factory` pinned `1.20.1`) from the management account via OpenTofu 1.12.2 + Terragrunt 1.0.8. Terragrunt generates the backend (S3 `chain-vote-tofu-state-{account_id}` + DynamoDB `chain-vote-tofu-locks`) and the five required provider aliases (`ct_management`, `log_archive`, `audit`, `aft_management`, `tf_backend_secondary_region`) — the AFT module explicitly manages neither.
+- **Deploy the AFT module** (`aws-ia/control_tower_account_factory` pinned `1.20.1`) from the management account via OpenTofu 1.12.2 + Terragrunt 1.0.8. Terragrunt generates the backend and the five required provider aliases (`ct_management`, `log_archive`, `audit`, `aft_management`, `tf_backend_secondary_region`) — the AFT module explicitly manages neither.
+- **State backend = GitLab-managed OpenTofu state** (HTTP backend) for every layer we drive: Terragrunt generates an `http` backend block pointing at the GitLab project's state endpoint (`/api/v4/projects/<id>/terraform/state/<name>`), lock/unlock via POST/DELETE. Auth: `CI_JOB_TOKEN` inside GitLab CI, short-lived project access token for local applies — never a long-lived PAT in a dotfile. Two caveats, stated up front:
+  - **AFT keeps its own internal backend regardless.** The module provisions its pipeline state in S3 + DynamoDB inside the AFT management account (with secondary-Region replication — that's what the `tf_backend_secondary_region` provider alias exists for). Not configurable to GitLab; don't fight it. GitLab holds *our* state; AFT holds *its* state.
+  - **FIPS boundary note:** state files contain resource metadata and occasionally secrets, and GitLab-managed state lives outside the AWS FIPS boundary — encrypted at rest by GitLab's controls, TLS in transit to an endpoint that is not a FIPS-validated one. Goes on the Phase 3 documented-exception list, not swept under the rug. Mitigate: keep secrets out of state (`sensitive` outputs, SSM parameter references over inline values), and if the compliance bar hardens, the self-managed-GitLab-on-FIPS-mode-instances option exists.
 - **GitLab wiring:** `vcs_provider = "gitlab"` (or `"gitlabselfmanaged"` + instance URL if self-hosted). Four repos, created before apply:
   - `aft-account-request` — account vending requests as HCL; a merge request *is* the account-creation workflow
   - `aft-global-customizations` — the FIPS 140-3 baseline from Phase 3; runs in every vended/enrolled account
@@ -249,6 +252,8 @@ Natural follow-up question: can tagging carry some of the enforcement load above
 - [ ] Create four AFT GitLab repos + confirm GitLab.com vs self-managed (`vcs_provider` value + instance URL)
 - [ ] Write the Terraform-inside-AFT runtime ADR (accept BUSL binary in pipeline vs patched buildspecs)
 - [ ] Runbook the CodeConnections GitLab OAuth authorization (human gate)
+- [ ] Add GitLab-managed state to the FIPS documented-exception list; sweep state files for inline secrets
+- [ ] Update project constraint docs (CLAUDE.md / PROJECT.md say S3+DynamoDB state) to match GitLab-managed state decision
 
 More to come...
 
