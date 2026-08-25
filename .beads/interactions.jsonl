@@ -1,0 +1,1 @@
+{"id":"int-23a7d57d","kind":"field_change","created_at":"2026-08-25T21:38:52.389362Z","actor":"John Reed","issue_id":"aws-infrastructure-b6r","extra":{"field":"status","new_value":"closed","old_value":"in_progress","reason":"Doc written, reviewed, committed 76e3e49, pushed"}}
