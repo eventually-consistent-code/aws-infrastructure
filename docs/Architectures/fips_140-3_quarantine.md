@@ -168,7 +168,7 @@ Same pattern extends to other resources (S3 public-access block + object copy, I
 1. Assessment + `AWSControlTowerExecution` roles in all pre-existing accounts; create the four AFT GitLab repos (empty is fine — wiring comes later).
 2. Deploy CT landing zone with customer-managed KMS at setup; Security OU accounts; register OUs; auto-enrollment on.
 3. Stand up AFT: vend AFT management account via Service Catalog, apply the AFT module (OpenTofu/Terragrunt, `vcs_provider = "gitlab"`), authorize the CodeConnections handshake, smoke-test with a throwaway sandbox account request.
-4. AFT baseline: full FIPS 140-3 global customizations + Isolation SGs; record the Terraform-inside-AFT runtime ADR.
+4. AFT baseline: full FIPS 140-3 global customizations + Isolation SGs.
 5. Enroll Dev accounts; overlay FIPS config via AFT; validate.
 6. Vend Forensics account; isolated analysis VPC via account customizations.
 7. GuardDuty / Security Hub / Config / Inspector org-wide, FIPS endpoints, CMK key-policy grants for malware scanning.
