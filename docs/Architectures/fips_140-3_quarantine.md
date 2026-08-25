@@ -1,14 +1,24 @@
 # FIPS 140-3 Control Tower Migration + Forensics Quarantine
 
 **Author(s):** John Reed
-**Date:** 2026-08-25
+**Date:** 2026-08-25 (rev 2 — reworked for the actual stack: OpenTofu + GitLab + AFT-from-scratch)
 **Status:** Reviewed draft — plan is sound with corrections (see [Review Verdict](#review-verdict) and [Changes I'd Make](#changes-id-make))
 
 ---
 
 ## Outcome:
 
-Adopt pre-existing Dev / Collab / Prod accounts into an AWS Control Tower (CT) landing zone, enforce a FIPS 140-3 cryptographic baseline everywhere, centralize detection in a Security Tooling account, and make the default incident-response modality "snapshot under FIPS KMS → isolate → copy evidence into a purpose-built Forensics account with an isolated analysis VPC." Every new account — including Forensics — comes out of Account Factory so the baseline is baked in, not bolted on.
+Adopt pre-existing Dev / Collab / Prod accounts into an AWS Control Tower (CT) landing zone, enforce a FIPS 140-3 cryptographic baseline everywhere, centralize detection in a Security Tooling account, and make the default incident-response modality "snapshot under FIPS KMS → isolate → copy evidence into a purpose-built Forensics account with an isolated analysis VPC." Every new account — including Forensics — comes out of Account Factory for Terraform (AFT) so the baseline is baked in, not bolted on.
+
+**Stack this plan is built on** (AFT is *not yet deployed* — standing it up is now Phase 2A, not an assumption):
+
+| Layer | Choice | Why |
+|-------|--------|-----|
+| IaC runtime | OpenTofu `1.12.2` (via Terragrunt `1.0.8`) | Licensing preference; Terragrunt v1.x defaults its binary lookup to `tofu` — zero extra config |
+| Orchestration | Terragrunt | DRY across accounts/environments; generates backend + provider wiring AFT's module deliberately doesn't manage |
+| Account vending | AFT module `aws-ia/control_tower_account_factory` `1.20.1` | Only AWS-supported Terraform-native vending path; account requests + customizations as code |
+| VCS | GitLab (`vcs_provider = "gitlab"`, or `"gitlabselfmanaged"` if self-hosted) | Team standard; AFT supports it natively via AWS CodeConnections |
+| State | S3 + DynamoDB, management account, us-east-1 | No external state services; management account owns all state |
 
 Why this shape: enrollment (not rebuild) preserves the existing workloads, Account Factory makes the baseline reproducible, and evidence-copy-to-Forensics beats analyze-in-place because the compromised account's blast radius never touches your analysis environment…
 
@@ -20,7 +30,10 @@ The plan is **architecturally sound**. The overall flow — assess → land CT �
 
 But several items as written are **unenforceable, mistimed, or stale**, and one is on a hard clock: FIPS 140-2 certificates move to the CMVP Historical list on **September 21, 2026** — weeks from this writing — so "FIPS-validated" claims need re-verification against active 140-3 certificates *now*, not at audit time. Details in [Changes I'd Make](#changes-id-make).
 
-One repo-specific correction up front: this project standardizes on **AFT (Account Factory for Terraform) + OpenTofu + Terragrunt**, so everywhere the plan says "CfCT (Customizations for Control Tower) or StackSets," read "AFT global/account customizations" first, StackSets only where AFT genuinely can't reach (e.g., resources in accounts AFT doesn't manage). Two customization pipelines is one too many.
+Two repo-specific corrections up front:
+
+1. This project standardizes on **AFT + OpenTofu + Terragrunt + GitLab**, so everywhere the original plan says "CfCT (Customizations for Control Tower) or StackSets," read "AFT global/account customizations" first, StackSets only where AFT genuinely can't reach (e.g., resources in accounts AFT doesn't manage). Two customization pipelines is one too many.
+2. **AFT does not exist yet in this org** — the original plan treated Account Factory as furniture that's already in the room. It isn't. Standing up AFT is its own phase (2A below) with its own prerequisites (dedicated AFT management account, four GitLab repos, a CodeConnections handshake) and its own honest caveat: AFT's internal pipelines run Terraform, not OpenTofu — see the runtime-split note in Phase 2A before anyone promises "OpenTofu everywhere" in an audit.
 
 ---
 
@@ -47,7 +60,24 @@ One repo-specific correction up front: this project standardizes on **AFT (Accou
 - CT creates and manages the **organization CloudTrail trail** itself — do not create a second org trail; configure the CT-managed one with the KMS key above, delivering to Log Archive.
 - Register the target OUs so they're governed.
 - Apply mandatory + strongly recommended + elective controls mapping to encryption, data protection, and NIST 800-53 / FedRAMP objectives.
-- Configure Account Factory via **AFT** so every future account receives the Phase 3 baseline through AFT global customizations; per-account deltas via AFT account customizations.
+- Account Factory configuration moves to Phase 2A — AFT has to exist before it can carry the baseline.
+
+### Phase 2A — Stand Up AFT (GitLab + OpenTofu)
+
+New phase — the original plan assumed Account Factory was already running. Building it:
+
+- **Vend the AFT management account first** via CT's built-in Account Factory (Service Catalog, console — one of the few unavoidable ClickOps moments). AFT requires its own dedicated account; it is not optional and it is not the CT management account.
+- **Deploy the AFT module** (`aws-ia/control_tower_account_factory` pinned `1.20.1`) from the management account via OpenTofu 1.12.2 + Terragrunt 1.0.8. Terragrunt generates the backend (S3 `chain-vote-tofu-state-{account_id}` + DynamoDB `chain-vote-tofu-locks`) and the five required provider aliases (`ct_management`, `log_archive`, `audit`, `aft_management`, `tf_backend_secondary_region`) — the AFT module explicitly manages neither.
+- **GitLab wiring:** `vcs_provider = "gitlab"` (or `"gitlabselfmanaged"` + instance URL if self-hosted). Four repos, created before apply:
+  - `aft-account-request` — account vending requests as HCL; a merge request *is* the account-creation workflow
+  - `aft-global-customizations` — the FIPS 140-3 baseline from Phase 3; runs in every vended/enrolled account
+  - `aft-account-customizations` — per-account deltas (Forensics VPC lives here)
+  - `aft-account-provisioning-customizations` — pre-handoff Step Functions hooks
+- **CodeConnections handshake:** AFT reaches GitLab through an AWS CodeConnections connection that must be authorized once, by a human, in the console (OAuth into GitLab). Human gate — put it on the runbook, don't let the pipeline sit "PENDING" for a week wondering why.
+- **FIPS posture for AFT itself:** set `AWS_USE_FIPS_ENDPOINT=true` in the customization CodeBuild environments; AFT's request-metadata DynamoDB and artifact buckets ride the baseline SCPs like everything else in the management/AFT accounts.
+- **The runtime split — say it plainly:** AFT's CodeBuild pipelines download and run **Terraform** (`terraform_distribution = "oss"`, fetched from releases.hashicorp.com). There is no OpenTofu option (upstream issue #451, open for years). So: every layer *we* drive — CT config, SCPs, the AFT module itself, IR playbooks, Forensics VPC definitions — runs OpenTofu; the execution *inside* AFT's customization pipelines runs Terraform. Two consequences:
+  - Keep all customization HCL compatible with both runtimes (Terraform `>= 1.6` feature set, no OpenTofu-only syntax like `.otf` overrides) so nothing forks.
+  - **Decision to make and record:** accept the BUSL-licensed Terraform binary running inside the AWS-managed pipeline (running it isn't the licensing concern OpenTofu exists to avoid — but it's a posture inconsistency worth a one-paragraph ADR), or maintain patched buildspecs that swap in `tofu` (unsupported, breaks on every AFT upgrade — I wouldn't). Recommendation: accept + ADR.
 
 ### Phase 3 — FIPS 140-3 Cryptographic Baseline (All Accounts, Existing and New)
 
@@ -75,7 +105,7 @@ Two methods, pick per scale:
 
 ### Phase 5 — Provision the Forensics Account via Account Factory
 
-- Vend the account through AFT under the High-Isolation / Forensics OU — full FIPS baseline, Isolation SGs, and roles arrive automatically.
+- Vend the account through AFT under the High-Isolation / Forensics OU — a reviewed merge request to `aft-account-request` is the entire creation workflow. Global customizations land the FIPS baseline, Isolation SGs, and roles automatically; the Forensics-specific build (analysis VPC, one-way KMS, receive-only roles) lives in `aft-account-customizations` so the whole account is reproducible from code.
 - Build the **isolated analysis VPC** (calling it "air-gapped" oversells it — it has VPC endpoints; isolated is the honest word, and honest words survive audits):
   - No Internet Gateway, no NAT Gateway, no public subnets.
   - Route tables: local routes + interface/gateway endpoints for the minimum FIPS-required service set (SSM, EC2, S3, KMS, CloudWatch Logs).
@@ -154,16 +184,16 @@ Same pattern extends to other resources (S3 public-access block + object copy, I
 
 ### Phase 10 — Implementation Roadmap
 
-1. Assessment + `AWSControlTowerExecution` roles in all pre-existing accounts. (~wk 1–2)
+1. Assessment + `AWSControlTowerExecution` roles in all pre-existing accounts; create the four AFT GitLab repos (empty is fine — wiring comes later). (~wk 1–2)
 2. Deploy CT landing zone with customer-managed KMS at setup; Security OU accounts; register OUs; auto-enrollment on. (~wk 2–3)
-3. AFT baseline: full FIPS 140-3 customizations + Isolation SGs. (~wk 3–5)
-4. Enroll Dev accounts; overlay FIPS config; validate. (~wk 5–6)
-5. Vend Forensics account via AFT; build isolated analysis VPC. (~wk 6–7)
-6. GuardDuty / Security Hub / Config / Inspector org-wide, FIPS endpoints, CMK key-policy grants for malware scanning. (~wk 7–8)
-7. Deploy + test the full snapshot → isolate → Forensics-transfer playbook in Dev, including an actual restore in Forensics. (~wk 8–9)
-8. Enroll Collab, then Prod (approval gates on). (~wk 9–10)
-9. Operationalize continuous FIPS monitoring, IR runbooks, scheduled Forensics-boundary validation. (~wk 10–11)
-10. Decommission legacy non-FIPS configuration; publish the final cryptographic-posture doc + certificate register. (~wk 11–12)
+3. Stand up AFT: vend AFT management account via Service Catalog, apply the AFT module (OpenTofu/Terragrunt, `vcs_provider = "gitlab"`), authorize the CodeConnections handshake, smoke-test with a throwaway sandbox account request. (~wk 3–4)
+4. AFT baseline: full FIPS 140-3 global customizations + Isolation SGs; record the Terraform-inside-AFT runtime ADR. (~wk 4–6)
+5. Enroll Dev accounts; overlay FIPS config via AFT; validate. (~wk 6–7)
+6. Vend Forensics account via `aft-account-request` MR; isolated analysis VPC via account customizations. (~wk 7–8)
+7. GuardDuty / Security Hub / Config / Inspector org-wide, FIPS endpoints, CMK key-policy grants for malware scanning. (~wk 8–9)
+8. Deploy + test the full snapshot → isolate → Forensics-transfer playbook in Dev, including an actual restore in Forensics. (~wk 9–10)
+9. Enroll Collab, then Prod (approval gates on). (~wk 10–11)
+10. Operationalize continuous FIPS monitoring, IR runbooks, scheduled Forensics-boundary validation; decommission legacy non-FIPS configuration; publish the final cryptographic-posture doc + certificate register. (~wk 11–13)
 
 ---
 
@@ -178,7 +208,7 @@ Ranked. 1–4 are correctness, the rest are hardening.
 5. **Create the evidence bucket with Object Lock enabled from day one** — it's a creation-time-only flag. Compliance mode + a defined retention period for chain of custody.
 6. **Grant GuardDuty in every customer-managed EBS key policy** or Malware Protection quietly skips your CMK-encrypted volumes — which, in this design, is all of them.
 7. **Supply the customer-managed KMS key at CT landing-zone creation** for CloudTrail/Config, and configure the CT-managed org trail rather than creating a parallel one.
-8. **Use AFT customizations, not CfCT/StackSets, as the delivery mechanism** — this repo already owns an AFT pipeline; a second customization channel is drift waiting to happen.
+8. **Use AFT customizations, not CfCT/StackSets, as the delivery mechanism** — and stand AFT up first (Phase 2A), since it doesn't exist yet. One customization channel; a second is drift waiting to happen. Record the Terraform-inside-AFT runtime split as an ADR rather than discovering it in an audit.
 9. **Rename "air-gapped" to "isolated" and back it with VPC endpoint policies** scoped to the evidence bucket + Forensics keys. The endpoints are the boundary; police them.
 10. **Pre-stage memory-capture tooling (AVML/LiME) in the golden AMIs.** A memory dump you can't take in the first minutes is a memory dump you don't get.
 11. **Kill-switch SCP needs explicit carve-outs** (IR-role `aws:PrincipalArn` conditions) for the evidence-recovery actions, or the kill switch kills your own investigation.
@@ -216,6 +246,9 @@ Natural follow-up question: can tagging carry some of the enforcement load above
 - [ ] Stage AVML in the FIPS golden AMI build
 - [ ] Write the security-tag-key protection SCP (`Quarantined`, `Environment`, `FIPSRequired`, `IncidentId`) + Organizations tag policies
 - [ ] Add `aws:ResourceTag/Quarantined=true` ABAC conditions to the IR role policy
+- [ ] Create four AFT GitLab repos + confirm GitLab.com vs self-managed (`vcs_provider` value + instance URL)
+- [ ] Write the Terraform-inside-AFT runtime ADR (accept BUSL binary in pipeline vs patched buildspecs)
+- [ ] Runbook the CodeConnections GitLab OAuth authorization (human gate)
 
 More to come...
 
@@ -226,6 +259,10 @@ More to come...
 - CT enrollment prerequisites: https://docs.aws.amazon.com/controltower/latest/userguide/enrollment-prerequisites.html
 - CT auto-enrollment: https://docs.aws.amazon.com/controltower/latest/userguide/account-auto-enrollment.html
 - AFT: https://docs.aws.amazon.com/controltower/latest/userguide/aft-overview.html
+- AFT module (pin 1.20.1): https://github.com/aws-ia/terraform-aws-control_tower_account_factory
+- AFT alternative VCS (GitLab) config: https://docs.aws.amazon.com/controltower/latest/userguide/aft-alternative-vcs.html
+- AFT OpenTofu support (open issue #451): https://github.com/aws-ia/terraform-aws-control_tower_account_factory/issues/451
+- AWS CodeConnections for GitLab: https://docs.aws.amazon.com/dtconsole/latest/userguide/connections-create-gitlab.html
 - EC2 incident response (AWS Security IR Guide): https://docs.aws.amazon.com/whitepapers/latest/aws-security-incident-response-guide/
 - `AWSSupport-ContainEC2Instance`: https://docs.aws.amazon.com/systems-manager-automation-runbooks/latest/userguide/automation-awssupport-containec2instance.html
 - ELB FIPS security policies: https://docs.aws.amazon.com/elasticloadbalancing/latest/application/create-https-listener.html
