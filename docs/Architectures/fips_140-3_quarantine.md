@@ -185,6 +185,27 @@ Ranked. 1–4 are correctness, the rest are hardening.
 12. **Document FIPS-endpoint exceptions per service** instead of asserting universal coverage — not every service has a FIPS endpoint in every Region; the audit answer is a documented exception list plus TLS 1.2+ everywhere, not a hopeful blanket claim.
 13. **Verify moving parts that drift:** current landing-zone version for auto-enrollment behavior, current concurrent-enrollment quota, current AL2023/Bottlerocket FIPS module certificate status. These change; hardcoding them into the runbook is how runbooks rot.
 
+## Tag-Based Automation: Where It Works (and Where It's a Trap)
+
+Natural follow-up question: can tagging carry some of the enforcement load above — particularly items 2, 6, and 11? Short version: tags are excellent *selectors* for automation and solid ABAC (attribute-based access control) guardrails, but they are not a security boundary unless writes to the tags themselves are locked down. A tag is only as trustworthy as the last principal allowed to write it…
+
+**Item 2 (FIPS endpoints) — no.** Tags attach to principals and resources; the problem is the transport path — which hostname the client called. No IAM condition, tag-based or otherwise, can see the endpoint. Where tags *do* help: scope the detective control. Alert only on non-FIPS calls originating from resources tagged `FIPSRequired=true`, which keeps the signal clean while legacy workloads migrate. Enforcement stays client-side config + CloudTrail `tlsDetails` detection.
+
+**Item 6 (GuardDuty + CMK) — partially.** Two separate mechanisms, don't conflate them:
+- The key-policy grant for the GuardDuty service principal is mandatory no matter what — service principals aren't taggable, so there's no ABAC route around it.
+- Scan *scoping* is genuinely tag-native: GuardDuty Malware Protection supports tag-based inclusion/exclusion lists (e.g., a `GuardDutyExcluded` tag). Tags decide which instances get scanned; the grant decides whether CMK-encrypted volumes can be scanned at all. Complement, not substitute.
+
+**Item 11 (kill-switch carve-out) — possible, but weaker than `PrincipalArn`.** SCPs support `aws:PrincipalTag` conditions, so a deny-all-except-`PrincipalTag/IRRole=true` carve-out works mechanically. The trap: an attacker inside the quarantined account holding `iam:TagRole` tags their own role and walks out of quarantine. A tag-based carve-out is only safe when paired with a second SCP denying `iam:TagRole` / `iam:UntagRole` / `TagResource` on the security tag keys (`aws:TagKeys` condition) for everyone except IR. At that point you've built two controls to do the job one `aws:PrincipalArn` condition does unforgeably. Keep the ARN condition; treat tags as an optional layer on top, not the load-bearing wall.
+
+**Where tags genuinely earn their keep in this design:**
+
+- **EventBridge trigger scoping** on environment tags — already in Phase 7; severity + resource type + `Environment` tag is the right filter trio.
+- **`IncidentId`-driven evidence pipelines** — the Forensics copy job selects snapshots by `IncidentId` tag instead of threading resource IDs through Step Functions state. Fewer moving parts in the state machine, and the tag doubles as chain-of-custody metadata.
+- **ABAC guardrail on the IR role itself** (the best addition tagging buys us): playbook step 1 tags the instance `Quarantined=true`; every subsequent IR-role permission carries a `aws:ResourceTag/Quarantined=true` condition. The IR role physically cannot snapshot, stop, or isolate anything that hasn't already been marked in-scope — a blast-radius limiter on our *own* automation, which is exactly the automation an attacker would most like to hijack.
+- **Snapshot-sharing lockdown:** SCP denying `ec2:ModifySnapshotAttribute` for everyone except the IR role — the evidence-copy mechanism opens a snapshot-sharing path; this closes it for every other principal.
+
+**Prerequisite for all of it:** AWS Organizations tag policies for hygiene, plus an SCP write-protecting the security tag keys (`Quarantined`, `Environment`, `FIPSRequired`, `IncidentId`) org-wide. Tag-based automation inherits the integrity of tag writes — a compromised workload that can rewrite `Environment=prod` to `Environment=dev` just downgraded its own approval gate. Lock the gate tags as hard as the quarantine tags.
+
 ## Open Items / TODO
 
 - [ ] Build the FIPS certificate register (CMVP cert numbers for KMS HSM, AWS-LC, Nitro, AL2023, Bottlerocket) — pre-9/21 deadline
@@ -193,6 +214,8 @@ Ranked. 1–4 are correctness, the rest are hardening.
 - [ ] Confirm current CT concurrent-account-operation quota + auto-enrollment behavior on the deployed landing-zone version
 - [ ] Test GuardDuty Malware Protection against a CMK-encrypted volume end-to-end
 - [ ] Stage AVML in the FIPS golden AMI build
+- [ ] Write the security-tag-key protection SCP (`Quarantined`, `Environment`, `FIPSRequired`, `IncidentId`) + Organizations tag policies
+- [ ] Add `aws:ResourceTag/Quarantined=true` ABAC conditions to the IR role policy
 
 More to come...
 
