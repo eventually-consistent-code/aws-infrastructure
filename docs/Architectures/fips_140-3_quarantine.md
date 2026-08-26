@@ -4,24 +4,29 @@
 
 ## Outcome:
 
-Adopt pre-existing Dev / Collab / Prod accounts into an AWS Control Tower (CT) landing zone, enforce a FIPS 140-3 cryptographic baseline everywhere, centralize detection in a Security Tooling account, and make the default incident-response modality "snapshot under FIPS KMS → isolate → copy evidence into a purpose-built Forensics account with an isolated analysis VPC." Every new account — including Forensics — comes out of Account Factory for Terraform (AFT) so the baseline is baked in, not bolted on.
+Adopt pre-existing Dev / Collab / Prod accounts into an AWS Control Tower (CT) landing zone **in AWS GovCloud (US)**, enforce a FIPS 140-3 cryptographic baseline everywhere, centralize detection in a Security Tooling account, and make the default incident-response modality "snapshot under FIPS KMS → isolate → copy evidence into a purpose-built Forensics account with an isolated analysis VPC." Every new account — including Forensics — comes out of a code-driven vending pipeline so the baseline is baked in, not bolted on.
 
-**Stack this plan is built on** (AFT is *not yet deployed* — standing it up is now Phase 2A, not an assumption):
+**This is a GovCloud plan, and GovCloud changes the architecture, not just the region names.** Three structural facts from the CT-GovCloud documentation drive everything below:
+
+1. **Accounts cannot be created inside GovCloud.** Every GovCloud account is born as a pair — a GovCloud account plus an associated commercial billing account — via the `CreateGovCloudAccount` API, callable *only* from the commercial-partition management account. CT's Account Factory "Create account" feature is removed in GovCloud, and CT cannot create the Audit / Log Archive accounts at landing-zone setup either.
+2. **AFT is off the table.** Per AWS's own docs, Account Factory for Terraform cannot be deployed by new AFT customers in GovCloud because CodeStar Connections (third-party VCS integration) isn't available there. Vending moves to a GitLab CI + OpenTofu pipeline we own (Phase 2A) — and losing AFT also deletes the old Terraform-inside-AFT runtime headache: this design is pure OpenTofu end to end.
+3. **FIPS is largely the default.** Most GovCloud service endpoints are FIPS-validated out of the box, which shrinks the Phase 3 exception list from "inventory everything" to "verify the stragglers."
 
 | Layer | Choice | Why |
 |-------|--------|-----|
-| IaC runtime | OpenTofu `1.12.2` (via Terragrunt `1.0.8`) | Licensing preference; Terragrunt v1.x defaults its binary lookup to `tofu` — zero extra config |
-| Orchestration | Terragrunt | DRY across accounts/environments; generates backend + provider wiring AFT's module deliberately doesn't manage |
-| Account vending | AFT module `aws-ia/control_tower_account_factory` `1.20.1` | Only AWS-supported Terraform-native vending path; account requests + customizations as code |
-| VCS | GitLab (`vcs_provider = "gitlab"`, or `"gitlabselfmanaged"` if self-hosted) | Team standard; AFT supports it natively via AWS CodeConnections |
+| Partition / Regions | AWS GovCloud (US) — home `us-gov-west-1`, secondary `us-gov-east-1` | CUI / ITAR / FedRAMP High boundary; FIPS endpoints default; two-Region pair covers replication + Security Hub aggregation |
+| IaC runtime | OpenTofu `1.12.2` (via Terragrunt `1.0.8`) | Licensing preference; Terragrunt v1.x defaults its binary lookup to `tofu` — zero extra config; with AFT gone there's no Terraform anywhere in the stack |
+| Orchestration | Terragrunt | DRY across accounts/environments; generates backend + provider wiring |
+| Account vending | GitLab CI + OpenTofu pipeline (`aws_organizations_account` with `create_govcloud = true` from the commercial management account) | The only path that exists in GovCloud — AFT can't deploy there (no CodeStar Connections); an MR is still the account-creation workflow |
+| VCS + CI | GitLab **self-managed, hosted inside GovCloud** | GitLab CI replaces CodePipeline as the pipeline engine (no CodeConnections dependency), and code + state stay inside the CUI boundary — GitLab.com would put both outside it |
 
-Why this shape: enrollment (not rebuild) preserves the existing workloads, Account Factory makes the baseline reproducible, and evidence-copy-to-Forensics beats analyze-in-place because the compromised account's blast radius never touches your analysis environment…
+Why this shape: enrollment (not rebuild) preserves the existing workloads, a code-driven vending pipeline makes the baseline reproducible, and evidence-copy-to-Forensics beats analyze-in-place because the compromised account's blast radius never touches your analysis environment…
 
 ---
 
 ### Phase 1 — Assessment and Preparation of Pre-Existing Accounts
 
-- Inventory every existing account (Dev, Collab, Prod, others): account IDs / root emails / current OU placement / Regions in use / VPCs / AWS Config recorders + delivery channels / CloudTrail trails / KMS keys / security groups / any non-FIPS configuration.
+- Inventory every existing account (Dev, Collab, Prod, others): account IDs / root emails / current OU placement / Regions in use / VPCs / AWS Config recorders + delivery channels / CloudTrail trails / KMS keys / security groups / any non-FIPS configuration. **GovCloud addition:** map every GovCloud account to its paired commercial billing account — the pairs share an email address and the commercial side lives in the commercial org; you'll operate credentials in both partitions for the rest of this plan, so record which is which now.
 - Start the **FIPS certificate register** here, not at audit time: exact CMVP certificate numbers for every module we'll lean on (KMS HSMs, Nitro crypto, AWS-LC, AL2023/Bottlerocket modules). Hard clock on this — CMVP moves all FIPS 140-2 certificates to the Historical list on **September 21, 2026**; anything still resting on a 140-2 cert stops being defensible then. AWS KMS HSMs already carry a 140-3 Security Level 3 certificate and AWS-LC has 140-3 certs; some OS-module certs are still mid-transition, so verify each one against the active 140-3 list.
 - Remediate enrollment blockers:
   - All accounts must live in the same AWS Organizations org that will host the landing zone.
@@ -32,60 +37,60 @@ Why this shape: enrollment (not rebuild) preserves the existing workloads, Accou
   - **Security OU** — Log Archive + Audit (Security Tooling).
   - **Workloads OU** — Dev, Collab, Prod (child OUs or direct placement).
   - **High-Isolation / Forensics OU** — the new Forensics account, with its own tighter SCP set.
-- Plan for auto-enrollment (verify current landing-zone version supports it — you'll be on 3.3+ anyway on a fresh deploy): moving an account into a registered OU applies baselines and controls automatically.
+- Plan for auto-enrollment cautiously: the CT-GovCloud docs state Account Factory supports **single-account enrollment only**. Verify whether OU-move auto-enrollment behaves in GovCloud the way it does in commercial before building a runbook around it — assume one-at-a-time until proven otherwise.
 
 ### Phase 2 — Deploy Control Tower Landing Zone and Security Accounts
 
-- Launch CT from the management account; designate Log Archive and Audit accounts (CT creates them if absent).
+- **Pre-create the Audit and Log Archive accounts — CT will not create them in GovCloud.** From the *commercial* management account, call `CreateGovCloudAccount` twice (Audit, Log Archive); each call creates a GovCloud account plus its commercial billing twin. From the GovCloud management account, invite both GovCloud accounts into the GovCloud org and accept the invitations. Only then does landing-zone setup have what it needs.
+- Launch CT from the GovCloud management account in the home Region (`us-gov-west-1`); designate the two pre-created accounts as Log Archive and Audit ("set up CT in an existing organization" flow).
 - **At landing-zone creation, supply a customer-managed KMS key** for CloudTrail and Config encryption. This is a setup-time option and retrofitting it later is drift-prone console surgery — do it on day one.
 - CT creates and manages the **organization CloudTrail trail** itself — do not create a second org trail; configure the CT-managed one with the KMS key above, delivering to Log Archive.
 - Register the target OUs so they're governed.
 - Apply mandatory + strongly recommended + elective controls mapping to encryption, data protection, and NIST 800-53 / FedRAMP objectives.
-- Account Factory configuration moves to Phase 2A — AFT has to exist before it can carry the baseline.
+- Account vending moves to Phase 2A — the pipeline has to exist before it can carry the baseline.
 
-### Phase 2A — Stand Up AFT (GitLab + OpenTofu)
+### Phase 2A — Account Vending Pipeline (GitLab CI + OpenTofu — the AFT Replacement)
 
-- **Vend the AFT management account first** via CT's built-in Account Factory (Service Catalog, console — one of the few unavoidable ClickOps moments). AFT requires its own dedicated account; it is not optional and it is not the CT management account.
-- **Deploy the AFT module** (`aws-ia/control_tower_account_factory` pinned `1.20.1`) from the management account via OpenTofu 1.12.2 + Terragrunt 1.0.8. Terragrunt generates the backend and the five required provider aliases (`ct_management`, `log_archive`, `audit`, `aft_management`, `tf_backend_secondary_region`) — the AFT module explicitly manages neither.
-- **State backend = GitLab-managed OpenTofu state** (HTTP backend) for every layer we drive: Terragrunt generates an `http` backend block pointing at the GitLab project's state endpoint (`/api/v4/projects/<id>/terraform/state/<name>`), lock/unlock via POST/DELETE. Auth: `CI_JOB_TOKEN` inside GitLab CI, short-lived project access token for local applies — never a long-lived PAT in a dotfile. One caveat, stated up front:
-  - **AFT keeps its own internal backend regardless.** The module provisions its pipeline state in S3 + DynamoDB inside the AFT management account (with secondary-Region replication — that's what the `tf_backend_secondary_region` provider alias exists for). Not configurable to GitLab. GitLab holds *our* state; AFT holds *its* state.
-- **GitLab wiring:** `vcs_provider = "gitlab"` (or `"gitlabselfmanaged"` + instance URL if self-hosted). Four repos, created before apply:
-  - `aft-account-request` — account vending requests as HCL; a merge request *is* the account-creation workflow
-  - `aft-global-customizations` — the FIPS 140-3 baseline from Phase 3; runs in every vended/enrolled account
-  - `aft-account-customizations` — per-account deltas (Forensics VPC lives here)
-  - `aft-account-provisioning-customizations` — pre-handoff Step Functions hooks
-- **CodeConnections handshake:** AFT reaches GitLab through an AWS CodeConnections connection that must be authorized once in the console (OAuth into GitLab). 
-- **FIPS posture for AFT itself:** set `AWS_USE_FIPS_ENDPOINT=true` in the customization CodeBuild environments; AFT's request-metadata DynamoDB and artifact buckets ride the baseline SCPs like everything else in the management/AFT accounts.
-- **The runtime split — say it plainly:** AFT's CodeBuild pipelines download and run **Terraform** (`terraform_distribution = "oss"`, fetched from releases.hashicorp.com). There is no OpenTofu option (upstream issue #451, open for years). So: every layer *we* drive — CT config, SCPs, the AFT module itself, IR playbooks, Forensics VPC definitions — runs OpenTofu; the execution *inside* AFT's customization pipelines runs Terraform. Consequence: keep all customization HCL compatible with both runtimes (Terraform `>= 1.6` feature set, no OpenTofu-only syntax like `.otf` overrides) so nothing forks.
+AFT cannot be deployed in GovCloud (no CodeStar Connections for third-party VCS — AWS's docs say so flatly), so we build the vending pipeline ourselves on the tools already in the stack. Smaller surface than AFT, honestly — no Service Catalog, no CodePipeline, no DynamoDB request queue — and the MR-driven workflow survives intact: a reviewed merge request is still how an account gets born.
+
+- **Host GitLab self-managed inside GovCloud** (FIPS-mode AL2023 instances, naturally — it rides the same Phase 3 baseline it delivers). GitLab CI is the pipeline engine; runners live in the management-layer accounts with least-privilege OIDC/role assumption. Code, CI, and state all stay inside the CUI boundary.
+- **State backend = GitLab-managed OpenTofu state** (HTTP backend): Terragrunt generates an `http` backend block pointing at the GitLab project's state endpoint (`/api/v4/projects/<id>/terraform/state/<name>`), lock/unlock via POST/DELETE. Auth: `CI_JOB_TOKEN` inside CI, short-lived project access token for local applies — never a long-lived PAT in a dotfile. Self-managed-in-GovCloud means state never leaves the boundary — the exception-list entry GitLab.com would have required simply doesn't exist.
+- **Repo layout** (replacing AFT's four):
+  - `account-vending` — account requests as HCL; runs in the *commercial* partition management account; `aws_organizations_account` with `create_govcloud = true` creates the GovCloud/commercial pair and captures the GovCloud account ID as an output
+  - `account-baseline` — the Phase 3 FIPS 140-3 baseline; applied cross-account into every enrolled account
+  - `account-overlays` — per-account deltas (the Forensics VPC lives here)
+- **The vending flow, end to end** (two partitions, so two credential contexts — CI stages are explicit about which):
+  1. MR to `account-vending` merges → commercial-partition job applies `CreateGovCloudAccount` via OpenTofu → pair exists.
+  2. GovCloud-partition job (GovCloud management account): invite the new GovCloud account into the GovCloud org, accept the invitation from the member side (`OrganizationAccountAccessRole`).
+  3. Enroll the account into CT (single-account enrollment — see Phase 4) and land it in its target OU.
+  4. Baseline job assumes `AWSControlTowerExecution` into the new account and applies `account-baseline`, then any matching `account-overlays` entry. Same job, same code path, for newly vended and newly enrolled pre-existing accounts — one baseline, one delivery mechanism.
+- **FIPS posture for the pipeline itself:** `AWS_USE_FIPS_ENDPOINT=true` in every CI job environment; runners on FIPS-mode instances; provider blocks partition-aware (`data.aws_partition` — ARNs are `arn:aws-us-gov:...` here, and hardcoded `arn:aws:` strings are a silent no-match bug in SCPs and trust policies).
+- **What we gave up with AFT, for the record:** the managed request-metadata store and AWS-side upgrades. What we got back: pure OpenTofu end to end (the old Terraform-inside-AFT runtime split is gone), one fewer dedicated account, and a pipeline whose every moving part is code we can read.
 
 ### Phase 3 — FIPS 140-3 Cryptographic Baseline (All Accounts, Existing and New)
 
 - **KMS:** customer-managed keys only, backed by AWS KMS HSMs (FIPS 140-3 Security Level 3 validated, FIPS-approved mode). Automatic rotation on. Key policies restrict to approved principals.
-  - Key policies **cannot** restrict use to FIPS endpoints — no IAM condition key distinguishes `kms-fips.us-east-1` from `kms.us-east-1`; they front the same service. So the model is: enforce client-side (`use_fips_endpoint = true`), **detect** server-side via CloudTrail `tlsDetails` (endpoint hostname + TLS version per API call), alert via a Config/Athena detective control on that field. Scope the alerting to resources tagged `FIPSRequired=true` so the signal stays clean while legacy workloads migrate — preventive where possible, detective where preventive is impossible.
-- **Endpoints:** force `use_fips_endpoint = true` (AWS CLI config, SDK config, `AWS_USE_FIPS_ENDPOINT=true` env var in Lambda / CodeBuild / SSM automation). All service calls target FIPS endpoints where they exist.
-  - *Caveat:* not every service publishes a FIPS endpoint in every Region. Inventory the FIPS endpoint list for each service you actually use in us-east-1, document the exceptions, and note that all AWS endpoints enforce TLS 1.2+ minimum regardless (AWS completed that deprecation in 2023) — the exceptions are a compliance-documentation problem, not a plaintext problem.
-- **Encryption at rest:** account-level default EBS encryption on, S3 SSE-KMS (or DSSE-KMS where dual-layer is required) — enforced via SCPs + Config rules + AFT baseline. Nitro-based instance families only.
+  - Key policies **cannot** restrict use to FIPS endpoints — no IAM condition key sees which hostname a call arrived on (and in GovCloud the standard KMS endpoint is FIPS-validated anyway). So the model is: enforce client-side (`use_fips_endpoint = true`), **detect** server-side via CloudTrail `tlsDetails` (endpoint hostname + TLS version per API call), alert via a Config/Athena detective control on that field. Scope the alerting to resources tagged `FIPSRequired=true` so the signal stays clean while legacy workloads migrate — preventive where possible, detective where preventive is impossible.
+- **Endpoints:** GovCloud does most of this work for us — the standard endpoints for most GovCloud services are FIPS-validated by default; that's a load-bearing reason the workload is in this partition at all. Still force `use_fips_endpoint = true` (AWS CLI config, SDK config, `AWS_USE_FIPS_ENDPOINT=true` env var in Lambda / GitLab CI / SSM automation) so clients resolve the explicit `*-fips` hostname where one exists and the posture is uniform across tooling.
+  - *Caveat:* "most" isn't "all." Inventory the endpoints for the services actually in use across `us-gov-west-1` / `us-gov-east-1`, document the handful of stragglers, and note that every AWS endpoint enforces TLS 1.2+ minimum regardless — the exceptions are a compliance-documentation problem, not a plaintext problem.
+- **Encryption at rest:** account-level default EBS encryption on, S3 SSE-KMS (or DSSE-KMS where dual-layer is required) — enforced via SCPs + Config rules + the `account-baseline` pipeline. Nitro-based instance families only.
 - **Encryption in transit:** TLS 1.2+ with FIPS-approved cipher suites. On ALB/NLB use the FIPS security policies (`ELBSecurityPolicy-TLS13-1-2-FIPS-2023-04` family, backed by AWS-LC FIPS). Security groups / endpoint policies block plaintext protocols.
 - **Operating system:** Amazon Linux 2023 or Bottlerocket in FIPS mode (`fips=1` kernel arg + FIPS-enabled crypto policy; validated modules: AL kernel Cryptographic API, OpenSSL FIPS provider, AWS-LC). Validate with `fips-mode-setup --check` / `sysctl crypto.fips_enabled` at boot and report via SSM inventory. Pre-stage memory-capture tooling (AVML or LiME) in the golden AMIs now — a memory dump you can't take in the first minutes of an incident is a memory dump you don't get.
-- **SCPs:** deny unencrypted resource creation; restrict Regions to those with the FIPS endpoint coverage you documented (us-east-1 home region fits); deny `ec2:ModifySnapshotAttribute` for everyone except the IR role — the Phase 7 evidence-copy mechanism opens a snapshot-sharing path, and this closes it for every other principal; kill-switch SCP that quarantines a whole account under the Forensics OU while carving out the evidence-recovery path (Phase 7).
+- **SCPs:** deny unencrypted resource creation; Region allowlist is beautifully short in this partition — `us-gov-west-1` and `us-gov-east-1`, deny everything else; write every SCP partition-aware (`arn:aws-us-gov:...` — a hardcoded `arn:aws:` condition silently matches nothing here, which for a Deny statement means the control just isn't there); deny `ec2:ModifySnapshotAttribute` for everyone except the IR role — the Phase 7 evidence-copy mechanism opens a snapshot-sharing path, and this closes it for every other principal; kill-switch SCP that quarantines a whole account under the Forensics OU while carving out the evidence-recovery path (Phase 7).
 - **Tag governance:** tags do real work in this design (trigger scoping, ABAC guardrails, evidence selection — Phases 6–8), and tag-based automation inherits the integrity of tag writes. So: AWS Organizations tag policies for hygiene, plus an SCP write-protecting the security tag keys (`Quarantined`, `Environment`, `FIPSRequired`, `IncidentId`) org-wide — deny `iam:TagRole` / `iam:UntagRole` / `TagResource` on those keys (`aws:TagKeys` condition) for everyone except IR and the platform pipeline. A compromised workload that can rewrite `Environment=prod` to `Environment=dev` just downgraded its own approval gate; lock the gate tags as hard as the quarantine tags. Tags are selectors and guardrails here — never the security boundary itself.
-- After each existing account enrolls, overlay the remaining FIPS config (Isolation Security Groups, cross-account IR roles, endpoint settings, AMI preferences) via AFT customizations; StackSets only as fallback.
+- After each existing account enrolls, overlay the remaining FIPS config (Isolation Security Groups, cross-account IR roles, endpoint settings, AMI preferences) via the `account-baseline` pipeline; StackSets only as fallback.
 
 ### Phase 4 — Enroll Pre-Existing Dev / Collab / Prod Accounts
 
-Two methods, pick per scale:
-
-**Method A — register an entire existing OU.** Prereqs met for every account under it (execution role present, Config conflicts deleted), then register the OU from the CT console. CT enrolls everything under it, deploys baseline stack sets, applies the OU's controls. Existing VPCs untouched.
-
-**Method B — enroll individually or via auto-enrollment.** Enroll from the CT console (email, display name, IAM Identity Center details, target OU), or — with auto-enrollment on — just move the account into a registered OU via Organizations / `MoveAccount` API.
+GovCloud narrows the menu: the CT-GovCloud docs state Account Factory supports **single-account enrollment only**. So the default here is one account at a time from the CT console (email, display name, IAM Identity Center details, target OU), with existing VPCs untouched. Registering an entire existing OU may still be available for baselining the OU itself — verify its enrollment behavior in this partition before leaning on it, and treat OU-move auto-enrollment the same way: prove it in a sandbox before it goes in a runbook.
 
 - Monitor enrollment; common failures are the missing execution role, Config recorder conflicts, and landing-zone drift.
-- Post-enrollment, run the AFT overlay to land the full FIPS baseline, Isolation SGs, and IR roles.
-- Batch enrollments respecting the current concurrent-account-operations quota (verify it in the console — it has moved over the years; don't hardcode "five"). Start with Dev, then Collab, then Prod with approval gates.
+- Post-enrollment, run the `account-baseline` pipeline to land the full FIPS baseline, Isolation SGs, and IR roles — same code path a freshly vended account gets.
+- Sequence enrollments Dev → Collab → Prod, with approval gates on Prod. Single-account enrollment makes the cadence serial anyway; use that to validate the baseline overlay on each Dev account before touching anything louder.
 
-### Phase 5 — Provision the Forensics Account via Account Factory
+### Phase 5 — Provision the Forensics Account via the Vending Pipeline
 
-- Vend the account through AFT under the High-Isolation / Forensics OU. Global customizations land the FIPS baseline, Isolation SGs, and roles automatically; the Forensics-specific build (analysis VPC, one-way KMS, receive-only roles) lives in `aft-account-customizations` so the whole account is reproducible from code.
+- Vend the account through the Phase 2A pipeline into the High-Isolation / Forensics OU — a reviewed MR to `account-vending` creates the GovCloud/commercial pair, the flow invites + enrolls it, and `account-baseline` lands the FIPS baseline, Isolation SGs, and roles automatically. The Forensics-specific build (analysis VPC, one-way KMS, receive-only roles) lives in `account-overlays` so the whole account is reproducible from code.
 - Build the **isolated analysis VPC** :
   - No Internet Gateway, no NAT Gateway, no public subnets.
   - Route tables: local routes + interface/gateway endpoints for the minimum FIPS-required service set (SSM, EC2, S3, KMS, CloudWatch Logs).
@@ -100,11 +105,11 @@ Two methods, pick per scale:
 
 In the Security Tooling (Audit) account:
 
-- Delegated administrator for GuardDuty, Security Hub, Config, Inspector, Detective, IAM Access Analyzer, Macie (if used).
+- Delegated administrator for GuardDuty, Security Hub, Config, Inspector, Detective, and IAM Access Analyzer. **Macie is not available in GovCloud** — sensitive-data discovery needs a different answer here (Glue/Athena classification jobs, or a third-party FedRAMP-authorized tool) if the requirement is real; don't leave a silent gap where the commercial plan had a service.
 - Organization-wide auto-enable for all current and future accounts.
-- FIPS endpoints on every service that offers them (per the Phase 3 inventory).
-- GuardDuty Malware Protection for EC2/EBS — **and grant the GuardDuty service in your customer-managed EBS key policies**, or scans of CMK-encrypted volumes fail silently into "skipped." Scan *scoping* is tag-native (inclusion/exclusion lists, e.g. a `GuardDutyExcluded` tag): tags decide which instances get scanned, the key grant decides whether CMK-encrypted volumes can be scanned at all — two different levers, don't conflate them.
-- Security Hub standards: FSBP, NIST SP 800-53, CIS, cross-Region aggregation to us-east-1.
+- FIPS endpoints per the Phase 3 posture (mostly default in this partition; verify the stragglers).
+- GuardDuty Malware Protection for EC2/EBS — verify current availability of the Malware Protection feature in the GovCloud Regions first (GovCloud feature parity trails commercial; the base detector is there, feature add-ons arrive later) — **and grant the GuardDuty service in your customer-managed EBS key policies**, or scans of CMK-encrypted volumes fail silently into "skipped." Scan *scoping* is tag-native (inclusion/exclusion lists, e.g. a `GuardDutyExcluded` tag): tags decide which instances get scanned, the key grant decides whether CMK-encrypted volumes can be scanned at all — two different levers, don't conflate them.
+- Security Hub standards: FSBP, NIST SP 800-53, CIS, cross-Region aggregation to `us-gov-west-1`.
 - Config conformance packs evaluating: EBS encryption, public snapshot status, IMDSv2 required, default encryption, and (custom rules + SSM inventory) OS FIPS-mode indicators and FIPS-endpoint usage via CloudTrail `tlsDetails`.
 - CloudTrail org trail + Config history land in Log Archive under the FIPS KMS key.
 
@@ -151,7 +156,7 @@ Same pattern extends to other resources (S3 public-access block + object copy, I
 - **Trigger layer:** EventBridge rules on GuardDuty findings, Security Hub `Findings – Imported`, Config compliance changes. Filter severity ≥ HIGH / resource type / environment tags.
 - **Orchestration:** Step Functions (multi-step visibility beats a Lambda monolith). Execution roles force FIPS endpoints.
 - **Cross-account:** Security Tooling assumes least-privilege IR role in the workload account (external ID + condition keys). Forensics has receive-only snapshot permissions.
-- **Playbook contents** (deployed via AFT customizations into every enrolled account): protect instance/volumes → snapshot + AMI + tag → volatile evidence via SSM Automation document → Isolation SG → copy to Forensics → optional stop/terminate → notify + update Security Hub.
+- **Playbook contents** (deployed via the `account-baseline` pipeline into every enrolled account): protect instance/volumes → snapshot + AMI + tag → volatile evidence via SSM Automation document → Isolation SG → copy to Forensics → optional stop/terminate → notify + update Security Hub.
 - **Human-in-the-loop:** Security Hub custom actions let an analyst fire the same playbook on demand; Prod defaults to approval-required.
 - **Adapt, don't rebuild:** Automated Security Response on AWS, the GuardDuty automated-response samples, and the `AWSSupport-ContainEC2Instance` SSM runbook — modified to force FIPS endpoints and finish with the Forensics copy.
 
@@ -165,13 +170,13 @@ Same pattern extends to other resources (S3 public-access block + object copy, I
 
 ### Phase 10 — Implementation Roadmap
 
-1. Assessment + `AWSControlTowerExecution` roles in all pre-existing accounts; create the four AFT GitLab repos (empty is fine — wiring comes later).
-2. Deploy CT landing zone with customer-managed KMS at setup; Security OU accounts; register OUs; auto-enrollment on.
-3. Stand up AFT: vend AFT management account via Service Catalog, apply the AFT module (OpenTofu/Terragrunt, `vcs_provider = "gitlab"`), authorize the CodeConnections handshake, smoke-test with a throwaway sandbox account request.
-4. AFT baseline: full FIPS 140-3 global customizations + Isolation SGs.
-5. Enroll Dev accounts; overlay FIPS config via AFT; validate.
-6. Vend Forensics account; isolated analysis VPC via account customizations.
-7. GuardDuty / Security Hub / Config / Inspector org-wide, FIPS endpoints, CMK key-policy grants for malware scanning.
+1. Assessment + `AWSControlTowerExecution` roles in all pre-existing accounts; map GovCloud↔commercial account pairs; stand up self-managed GitLab inside GovCloud and create the three pipeline repos (`account-vending`, `account-baseline`, `account-overlays`).
+2. Pre-create Audit + Log Archive account pairs via `CreateGovCloudAccount` from the commercial management account; invite into the GovCloud org; deploy the CT landing zone in `us-gov-west-1` with customer-managed KMS at setup; register OUs.
+3. Build the vending pipeline: commercial-side `account-vending` job, GovCloud-side invite/enroll job, cross-account baseline job; smoke-test end to end with a throwaway sandbox account pair.
+4. Baseline: full FIPS 140-3 `account-baseline` + Isolation SGs.
+5. Enroll Dev accounts (single-account enrollment); overlay FIPS config via the baseline pipeline; validate.
+6. Vend Forensics account; isolated analysis VPC via `account-overlays`.
+7. GuardDuty / Security Hub / Config / Inspector / Detective org-wide; verify Malware Protection availability; CMK key-policy grants for malware scanning; decide the Macie-gap answer.
 8. Deploy + test the full snapshot → isolate → Forensics-transfer playbook in Dev, including an actual restore in Forensics.
 9. Enroll Collab, then Prod (approval gates on).
 10. Operationalize continuous FIPS monitoring, IR runbooks, scheduled Forensics-boundary validation; decommission legacy non-FIPS configuration; publish the final cryptographic-posture doc + certificate register.
@@ -184,11 +189,10 @@ Same pattern extends to other resources (S3 public-access block + object copy, I
 - AWS FIPS endpoints: https://aws.amazon.com/compliance/fips/
 - CT enrollment prerequisites: https://docs.aws.amazon.com/controltower/latest/userguide/enrollment-prerequisites.html
 - CT auto-enrollment: https://docs.aws.amazon.com/controltower/latest/userguide/account-auto-enrollment.html
-- AFT: https://docs.aws.amazon.com/controltower/latest/userguide/aft-overview.html
-- AFT module (pin 1.20.1): https://github.com/aws-ia/terraform-aws-control_tower_account_factory
-- AFT alternative VCS (GitLab) config: https://docs.aws.amazon.com/controltower/latest/userguide/aft-alternative-vcs.html
-- AFT OpenTofu support (open issue #451): https://github.com/aws-ia/terraform-aws-control_tower_account_factory/issues/451
-- AWS CodeConnections for GitLab: https://docs.aws.amazon.com/dtconsole/latest/userguide/connections-create-gitlab.html
+- CT in AWS GovCloud (US) — differences (account creation, BYO Audit/Log Archive, no AFT): https://docs.aws.amazon.com/govcloud-us/latest/UserGuide/govcloud-controltower.html
+- `CreateGovCloudAccount` API: https://docs.aws.amazon.com/organizations/latest/APIReference/API_CreateGovCloudAccount.html
+- `aws_organizations_account` (`create_govcloud`): https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/organizations_account
+- AWS GovCloud (US) User Guide (per-service differences): https://docs.aws.amazon.com/govcloud-us/latest/UserGuide/
 - EC2 incident response (AWS Security IR Guide): https://docs.aws.amazon.com/whitepapers/latest/aws-security-incident-response-guide/
 - `AWSSupport-ContainEC2Instance`: https://docs.aws.amazon.com/systems-manager-automation-runbooks/latest/userguide/automation-awssupport-containec2instance.html
 - ELB FIPS security policies: https://docs.aws.amazon.com/elasticloadbalancing/latest/application/create-https-listener.html
